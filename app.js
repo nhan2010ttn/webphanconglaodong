@@ -21,23 +21,33 @@ const db = getFirestore(app);
 const ADMIN_PASSWORD = "13579";
 const DAYS = ['mon','tue','wed','thu','fri','sat'];
 const DAY_LABEL = { mon:'Thứ 2', tue:'Thứ 3', wed:'Thứ 4', thu:'Thứ 5', fri:'Thứ 6', sat:'Thứ 7' };
+const DAY_INDEX = { mon:0, tue:1, wed:2, thu:3, fri:4, sat:5 };
 const MAX_PHOTOS_PER_DAY = 5;
+const MAX_CONFESS_IMAGES = 5;
 
-/* Kích thước nén ảnh — càng nhỏ càng tiết kiệm Firestore */
+/* Ảnh trực nhật */
 const IMG_MAX_SIZE = 900;
 const IMG_QUALITY = 0.55;
-const IMG_MAX_BYTES = 700 * 1024; // giới hạn an toàn dưới 1MB/document
+const IMG_MAX_BYTES = 700 * 1024;
+
+/* Ảnh mách lẻo (nhiều ảnh hơn → nén mạnh hơn) */
+const CONFESS_IMG_MAX_SIZE = 700;
+const CONFESS_IMG_QUALITY = 0.45;
+const CONFESS_IMG_MAX_BYTES = 180 * 1024;
+const CONFESS_TOTAL_MAX_BYTES = 900 * 1024;
 
 /* ========== STATE ========== */
 let isAdmin = false;
 let weeks = [];
 let messages = [];
+let confesses = [];
 let view = { screen: 'home', weekId: null, assignmentId: null };
 let currentWeekData = null;
 let currentAssignments = [];
 let currentAssignmentData = null;
 let currentPhotos = [];
 let pendingDay = null;
+let confessImages = []; // danh sách dataUrl đang chọn trong form
 
 let weekUnsub = null;
 let assignUnsub = null;
@@ -74,6 +84,7 @@ function fmtRelativeVN(ts){
   if (diff < 60) return 'vừa xong';
   if (diff < 3600) return Math.floor(diff/60) + ' phút trước';
   if (diff < 86400) return Math.floor(diff/3600) + ' giờ trước';
+  if (diff < 604800) return Math.floor(diff/86400) + ' ngày trước';
   return fmtDateTimeVN(ts);
 }
 function initials(name){
@@ -86,10 +97,76 @@ function bytesToStr(b){
   if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
   return (b/(1024*1024)).toFixed(2) + ' MB';
 }
+function todayISO(){
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function addDaysISO(iso, days){
+  if (!iso) return '';
+  const [y,m,d] = iso.split('-').map(Number);
+  const date = new Date(y, m-1, d);
+  date.setDate(date.getDate() + days);
+  return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
+}
+function fmtDateShort(iso){
+  if (!iso) return '';
+  const [y,m,d] = iso.split('-');
+  return `${d}/${m}`;
+}
+
+/* Tính deadline (Date object) cho 1 ngày cụ thể trong tuần
+   Trả về null nếu ngày đó không có deadline */
+function getDeadlineDate(week, day, deadlineStr){
+  if (!deadlineStr || !week?.startDate) return null;
+  const offset = DAY_INDEX[day];
+  const dayISO = addDaysISO(week.startDate, offset);
+  const [y,m,d] = dayISO.split('-').map(Number);
+  const [h,mi] = deadlineStr.split(':').map(Number);
+  return new Date(y, m-1, d, h, mi, 0, 0);
+}
+
+/* Đánh giá trạng thái 1 ngày:
+   - null: không có deadline
+   - 'ontime': có ít nhất 1 ảnh upload trước deadline
+   - 'late': có ảnh nhưng ảnh đầu tiên sau deadline
+   - 'absent': quá deadline + 10 phút mà chưa có ảnh nào
+   - 'pending': chưa tới deadline + 10 phút, chưa có ảnh
+   - 'empty': có deadline nhưng chưa tới giờ, chưa có ảnh (giống pending)
+*/
+function evaluateDay(week, day, deadlineStr, photos){
+  if (!deadlineStr) return null;
+  const deadline = getDeadlineDate(week, day, deadlineStr);
+  if (!deadline) return null;
+
+  const grace = new Date(deadline.getTime() + 10*60*1000);
+  const now = new Date();
+
+  if (photos.length > 0){
+    // Lấy ảnh sớm nhất
+    const firstPhoto = photos
+      .map(p => p.uploadedAt?.toDate?.() || null)
+      .filter(Boolean)
+      .sort((a,b) => a - b)[0];
+    if (!firstPhoto) return 'ontime';
+    if (firstPhoto <= deadline) return 'ontime';
+    return 'late';
+  }
+
+  // Chưa có ảnh
+  if (now > grace) return 'absent';
+  return 'pending';
+}
+
+function statusInfo(status){
+  if (status === 'ontime') return { cls:'ontime', text:'🟢 Đúng giờ' };
+  if (status === 'late') return { cls:'late', text:'🟡 Trễ' };
+  if (status === 'absent') return { cls:'absent', text:'🔴 Không lao động' };
+  if (status === 'pending') return { cls:'pending', text:'⚪ Chưa nộp' };
+  return null;
+}
 
 /* ========== MODAL ========== */
 function openModal({ title, body, footer, wide, onOpen }){
-  // Push history state để nút back đóng được modal
   history.pushState({ ...(history.state || {}), _modal: true }, '');
 
   $('modalRoot').innerHTML = `
@@ -117,12 +194,10 @@ function openModal({ title, body, footer, wide, onOpen }){
 
 function closeModal(){
   if (!document.querySelector('.modal-overlay')) return;
-  // Nếu state hiện tại là modal → gọi back để tránh bị kẹt history
   if (history.state?._modal){
     history.back();
     return;
   }
-  // Fallback
   $('modalRoot').innerHTML = '';
   document.removeEventListener('keydown', escHandler);
 }
@@ -135,20 +210,24 @@ function updateHeader(){
   const title = $('pageTitle');
   const bc = $('breadcrumb');
   const inboxBtn = $('inboxBtn');
+  const confessBtn = $('confessBtn');
 
-  // Nút back
   backBtn.classList.toggle('hidden', view.screen === 'home');
 
-  // Title
   if (view.screen === 'home'){
     title.textContent = 'Phân Công Trực Nhật';
+    confessBtn.classList.add('hidden');
   } else if (view.screen === 'week'){
     title.textContent = currentWeekData ? currentWeekData.name : 'Tuần';
+    confessBtn.classList.remove('hidden');
   } else if (view.screen === 'assignment'){
     title.textContent = currentAssignmentData ? currentAssignmentData.studentName : 'Chi tiết';
+    confessBtn.classList.remove('hidden');
+  } else if (view.screen === 'confess'){
+    title.textContent = '🚨 Mách lẻo';
+    confessBtn.classList.add('hidden');
   }
 
-  // Breadcrumb
   if (view.screen === 'home'){
     bc.classList.add('hidden');
   } else if (view.screen === 'week'){
@@ -157,28 +236,39 @@ function updateHeader(){
   } else if (view.screen === 'assignment'){
     bc.classList.remove('hidden');
     bc.innerHTML = `<span>Trang chủ</span><span class="sep">›</span><span>${esc(currentWeekData?.name || '...')}</span><span class="sep">›</span><span class="current">${esc(currentAssignmentData?.studentName || '...')}</span>`;
+  } else if (view.screen === 'confess'){
+    bc.classList.remove('hidden');
+    bc.innerHTML = `<span>Trang chủ</span><span class="sep">›</span><span class="current">Mách lẻo</span>`;
   }
 
-  // Hộp thư
   inboxBtn.classList.toggle('hidden', !isAdmin);
 }
 
 function updateFab(){
-  const fab = $('fabAdmin');
+  const fabAdmin = $('fabAdmin');
+  const fabConfess = $('fabConfess');
+
   if (isAdmin){
-    fab.classList.add('admin');
-    fab.title = 'Đang ở chế độ Admin (bấm để thoát)';
-    fab.innerHTML = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    fabAdmin.classList.add('admin');
+    fabAdmin.title = 'Đang ở chế độ Admin (bấm để thoát)';
+    fabAdmin.innerHTML = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M2 4l3 12h14l3-12-6 7-4-7-4 7-6-7z"/>
       <path d="M5 20h14"/>
     </svg>`;
   } else {
-    fab.classList.remove('admin');
-    fab.title = 'Quyền Admin';
-    fab.innerHTML = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    fabAdmin.classList.remove('admin');
+    fabAdmin.title = 'Quyền Admin';
+    fabAdmin.innerHTML = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <rect x="3" y="11" width="18" height="11" rx="2"/>
       <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
     </svg>`;
+  }
+
+  // FAB mách lẻo chỉ hiện khi ở trang chủ, hoặc ẩn khi đã ở trang mách lẻo
+  if (view.screen === 'confess'){
+    fabConfess.classList.add('hidden');
+  } else {
+    fabConfess.classList.remove('hidden');
   }
 }
 
@@ -210,7 +300,6 @@ function navigate(screen, params = {}, push = true){
 function applyState(state){
   view = state;
 
-  // Reset dữ liệu tạm
   if (state.screen === 'home'){
     currentWeekData = null;
     currentAssignments = [];
@@ -239,7 +328,6 @@ function renderScreen(){
     const w = weeks.find(x => x.id === view.weekId);
     if (w) currentWeekData = w;
     renderWeek();
-    // Subscribe assignments
     const q = query(collection(db, 'assignments'), where('weekId','==',view.weekId));
     weekUnsub = onSnapshot(q, snap => {
       currentAssignments = snap.docs.map(d => ({ id: d.id, ...d.data() }))
@@ -247,18 +335,15 @@ function renderScreen(){
       if (view.screen === 'week') renderWeek();
     }, err => { console.error(err); toast('❌ Lỗi tải: ' + err.message); });
   } else if (view.screen === 'assignment'){
-    // Nếu chưa có currentAssignmentData (VD khi reload trang), chờ từ snapshot của week
     const a = currentAssignments.find(x => x.id === view.assignmentId);
     if (a) currentAssignmentData = a;
     renderAssignment();
-    // Subscribe assignment detail
     assignUnsub = onSnapshot(doc(db, 'assignments', view.assignmentId), snap => {
       if (snap.exists()){
         currentAssignmentData = { id: snap.id, ...snap.data() };
         if (view.screen === 'assignment') { renderAssignment(); updateHeader(); }
       }
     });
-    // Subscribe photos
     const pq = query(collection(db, 'photos'), where('assignmentId','==',view.assignmentId));
     photoUnsub = onSnapshot(pq, snap => {
       currentPhotos = snap.docs.map(d => ({ id: d.id, ...d.data() }))
@@ -269,41 +354,36 @@ function renderScreen(){
         });
       if (view.screen === 'assignment') renderAssignment();
     });
+  } else if (view.screen === 'confess'){
+    renderConfessScreen();
   }
 }
 
-/* Public API cho HTML onclick */
 window.openWeek = (weekId) => {
   navigate('week', { weekId, assignmentId: null });
 };
-
 window.openAssignment = (assignmentId) => {
   navigate('assignment', { weekId: view.weekId, assignmentId });
 };
+window.openConfess = () => {
+  navigate('confess', {});
+};
 
-/* Nút back trên header */
 $('backBtn').onclick = () => history.back();
 
-/* Xử lý nút back cứng + browser back */
 window.addEventListener('popstate', (e) => {
   const state = e.state || { screen: 'home', weekId: null, assignmentId: null };
 
-  // Nếu đang có modal → đóng modal
   if (document.querySelector('.modal-overlay')){
     $('modalRoot').innerHTML = '';
     document.removeEventListener('keydown', escHandler);
-    // Nếu state mới có _modal thì push lại state đó để giữ modal "ảo"
     if (state._modal){
       history.pushState(state, '');
       return;
     }
   }
 
-  // Nếu state là _modal thuần → không điều hướng
-  if (state._modal){
-    // Tìm state gần nhất không phải modal
-    return;
-  }
+  if (state._modal) return;
 
   cleanupSubs();
   applyState(state);
@@ -316,19 +396,32 @@ function subscribeWeeks(){
     weeks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     if (view.screen === 'week' && view.weekId){
       const w = weeks.find(x => x.id === view.weekId);
-      if (w) { currentWeekData = w; updateHeader(); }
+      if (w) { currentWeekData = w; updateHeader(); if (view.screen === 'week') renderWeek(); }
     }
     if (view.screen === 'home') renderHome();
+    if (view.screen === 'assignment' && currentAssignmentData){
+      // Cập nhật week info cho assignment
+      const w = weeks.find(x => x.id === currentAssignmentData.weekId);
+      if (w) { currentWeekData = w; renderAssignment(); }
+    }
   }, err => console.error('weeks:', err));
 }
 
 function subscribeMessages(){
-  const q = query(collection(db, 'messages'), orderBy('uploadedAt','desc'), limit(100));
+  const q = query(collection(db, 'messages'), orderBy('uploadedAt','desc'), limit(200));
   onSnapshot(q, snap => {
     messages = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     updateInboxBadge();
     if (document.querySelector('.inbox-modal')) renderInboxModal();
   }, err => console.error('messages:', err));
+}
+
+function subscribeConfesses(){
+  const q = query(collection(db, 'confesses'), orderBy('createdAt','desc'), limit(200));
+  onSnapshot(q, snap => {
+    confesses = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (view.screen === 'confess') renderConfessScreen();
+  }, err => console.error('confesses:', err));
 }
 
 /* ========== RENDER: HOME ========== */
@@ -359,12 +452,33 @@ function renderHome(){
         <div class="week-card" onclick="openWeek('${w.id}')">
           <div class="week-icon">📅</div>
           <div class="week-name">${esc(w.name)}</div>
-          <div class="week-meta">${w.createdAt ? fmtDateTimeVN(w.createdAt) : 'Mới tạo'}</div>
+          <div class="week-meta">${w.startDate ? 'Bắt đầu ' + fmtDateShort(w.startDate) : (w.createdAt ? fmtDateTimeVN(w.createdAt) : 'Mới tạo')}</div>
           ${isAdmin ? `<button class="week-delete"
             onclick="event.stopPropagation();deleteWeek('${w.id}','${esc(w.name)}')"
             title="Xóa tuần">✕</button>` : ''}
         </div>`).join('')}
+    </div>
+
+    <div class="section-head" style="margin-top:24px">
+      <div class="section-title">Mách lẻo</div>
+      <button class="btn pink" onclick="openConfess()">
+        Xem tất cả →
+      </button>
+    </div>
+    ${renderConfessPreview()}
+  `;
+}
+
+function renderConfessPreview(){
+  if (!confesses.length){
+    return `<div class="empty" style="padding:30px 16px">
+      <div class="empty-icon" style="font-size:36px">🚨</div>
+      <h3 style="font-size:15px">Chưa có mách lẻo nào</h3>
+      <p style="font-size:13px">Bấm nút <b style="color:#ec4899">+</b> ở góc dưới để đăng bài đầu tiên.</p>
     </div>`;
+  }
+  const preview = confesses.slice(0, 2);
+  return `<div>${preview.map(c => confessCardHTML(c, true)).join('')}</div>`;
 }
 
 /* ========== RENDER: WEEK ========== */
@@ -398,12 +512,16 @@ function renderWeek(){
 
 function assignmentCardHTML(a){
   const hasContent = DAYS.some(d => a[d]);
+  const hasDeadline = a.deadlines && Object.values(a.deadlines).some(v => v);
   return `
     <div class="assign-card" onclick="openAssignment('${a.id}')">
       <div class="assign-avatar">${esc(initials(a.studentName))}</div>
       <div class="assign-info">
         <div class="assign-name">${esc(a.studentName)}</div>
-        <div class="assign-meta">${hasContent ? '📌 Đã có lịch trực' : 'Chưa có lịch'}</div>
+        <div class="assign-meta">
+          ${hasContent ? '📌 Đã có lịch trực' : 'Chưa có lịch'}
+          ${hasDeadline ? ' · ⏰' : ''}
+        </div>
       </div>
       ${isAdmin ? `<button class="assign-delete"
         onclick="event.stopPropagation();deleteAssignment('${a.id}','${esc(a.studentName)}')"
@@ -414,25 +532,34 @@ function assignmentCardHTML(a){
 /* ========== RENDER: ASSIGNMENT ========== */
 function renderAssignment(){
   const c = $('content');
-  if (!currentAssignmentData){
+  if (!currentAssignmentData || !currentWeekData){
     c.innerHTML = `<div class="empty"><div class="empty-icon">⏳</div><h3>Đang tải...</h3></div>`;
     return;
   }
   c.innerHTML = `<div class="day-grid">
-    ${DAYS.map(d => dayCardHTML(d, currentAssignmentData[d])).join('')}
+    ${DAYS.map(d => dayCardHTML(d)).join('')}
   </div>`;
 }
 
-function dayCardHTML(day, content){
+function dayCardHTML(day){
+  const content = currentAssignmentData[day] || '';
+  const deadline = (currentAssignmentData.deadlines || {})[day] || '';
   const photos = currentPhotos.filter(p => p.day === day);
   const canUpload = photos.length < MAX_PHOTOS_PER_DAY;
   const isFull = photos.length >= MAX_PHOTOS_PER_DAY;
+
+  const status = evaluateDay(currentWeekData, day, deadline, photos);
+  const info = statusInfo(status);
 
   return `
     <div class="day-card">
       <div class="day-head">
         <div class="day-name">${DAY_LABEL[day]}</div>
-        <div class="day-count ${isFull ? 'full' : ''}">${photos.length}/${MAX_PHOTOS_PER_DAY} ảnh</div>
+        <div class="day-meta">
+          ${deadline ? `<span class="day-deadline">🕐 ${esc(deadline)}</span>` : ''}
+          ${info ? `<span class="day-status ${info.cls}">${info.text}</span>` : ''}
+          <span class="day-count ${isFull ? 'full' : ''}">${photos.length}/${MAX_PHOTOS_PER_DAY}</span>
+        </div>
       </div>
       <div class="day-content">${
         content ? esc(content) : '<span class="empty-text">Không có nội dung</span>'
@@ -456,6 +583,79 @@ function dayCardHTML(day, content){
       </div>
     </div>`;
 }
+
+/* ========== RENDER: CONFESS ========== */
+function renderConfessScreen(){
+  const c = $('content');
+  c.innerHTML = `
+    <div class="section-head">
+      <div class="section-title">Bảng mách lẻo</div>
+      <button class="btn pink" onclick="openCreateConfess()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        Đăng bài
+      </button>
+    </div>
+    ${!confesses.length
+      ? `<div class="empty">
+           <div class="empty-icon">🚨</div>
+           <h3>Chưa có mách lẻo nào</h3>
+           <p>Hãy là người đầu tiên đăng bài!</p>
+           <button class="btn pink" onclick="openCreateConfess()">+ Đăng mách lẻo</button>
+         </div>`
+      : confesses.map(c => confessCardHTML(c)).join('')}
+  `;
+}
+
+function confessCardHTML(conf, isPreview){
+  const anon = conf.anonymous;
+  const author = anon ? 'Ẩn danh' : (conf.author || 'Ẩn danh');
+  const imgs = conf.images || [];
+  const imgsCount = imgs.length;
+  const canDelete = isAdmin;
+  const timeStr = conf.createdAt ? fmtRelativeVN(conf.createdAt) : '';
+
+  return `
+    <div class="confess-card">
+      <div class="confess-head">
+        <div class="confess-avatar ${anon ? 'anon' : ''}">${esc(initials(author))}</div>
+        <div class="confess-meta">
+          <div class="confess-author">${esc(author)}</div>
+          <div class="confess-time">🕐 ${timeStr}${isAdmin && conf.createdAt ? ' · ' + fmtDateTimeVN(conf.createdAt) : ''}</div>
+        </div>
+        ${canDelete ? `<button class="confess-delete" title="Xóa bài"
+          onclick="deleteConfess('${conf.id}')">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          </svg>
+        </button>` : ''}
+      </div>
+      ${conf.content ? `<div class="confess-body">${esc(conf.content)}</div>` : ''}
+      ${imgsCount ? `
+        <div class="confess-images count-${imgsCount}">
+          ${imgs.map((src, i) => `<img src="${src}" onclick="openConfessPhoto('${conf.id}',${i})" loading="lazy" alt="Ảnh"/>`).join('')}
+        </div>
+      ` : ''}
+    </div>`;
+}
+
+window.openConfessPhoto = (confId, idx) => {
+  const conf = confesses.find(x => x.id === confId);
+  if (!conf) return;
+  const src = conf.images[idx];
+  if (!src) return;
+  openModal({
+    title: '📷 Ảnh',
+    wide: true,
+    body: `<img src="${src}" style="width:100%;border-radius:14px"/>`,
+    footer: `
+      <a class="btn ghost" href="${src}" download="anh_${confId}_${idx}.jpg">⬇️ Tải về</a>
+      <button class="btn ghost" onclick="closeModal()">Đóng</button>
+    `
+  });
+};
 
 /* ========== ADMIN LOGIN ========== */
 $('fabAdmin').onclick = () => {
@@ -484,9 +684,17 @@ window.openCreateWeek = () => {
   openModal({
     title: '📅 Tạo tuần mới',
     body: `
+      <div class="hint">
+        💡 <b>Ngày bắt đầu tuần</b> là ngày <b>Thứ 2</b> của tuần đó.
+        Hệ thống dùng ngày này để tính deadline cho từng ngày T2→T7.
+      </div>
       <div class="field">
         <label>Tên tuần</label>
         <input id="w-name" value="${esc(suggested)}" autocomplete="off" placeholder="VD: Tuần 1"/>
+      </div>
+      <div class="field">
+        <label>Ngày thứ 2 của tuần</label>
+        <input id="w-start" type="date" value="${todayISO()}"/>
       </div>
       <div class="field">
         <label>Thứ tự (số càng nhỏ càng lên đầu)</label>
@@ -501,10 +709,12 @@ window.openCreateWeek = () => {
   setTimeout(() => $('w-name')?.focus(), 100);
   $('btnCreateWeek').onclick = async () => {
     const name = $('w-name').value.trim();
+    const startDate = $('w-start').value;
     const order = parseInt($('w-order').value) || (weeks.length + 1);
     if (!name){ toast('⚠️ Nhập tên tuần'); return; }
+    if (!startDate){ toast('⚠️ Chọn ngày thứ 2 của tuần'); return; }
     try {
-      await addDoc(collection(db, 'weeks'), { name, order, createdAt: serverTimestamp() });
+      await addDoc(collection(db, 'weeks'), { name, startDate, order, createdAt: serverTimestamp() });
       toast('✅ Đã tạo tuần');
       closeModal();
     } catch(e){ toast('❌ Lỗi: ' + e.message); }
@@ -512,7 +722,7 @@ window.openCreateWeek = () => {
 };
 
 window.deleteWeek = async (weekId, name) => {
-  if (!confirm(`Xóa "${name}"?\n\nTất cả phân công và ảnh của tuần này sẽ bị xóa vĩnh viễn.`)) return;
+  if (!confirm(`Xóa "${name}"?\n\nTất cả phân công, ảnh và mách lẻo liên quan sẽ bị xóa vĩnh viễn.`)) return;
   toast('⏳ Đang xóa...');
   try {
     const assignSnap = await getDocs(query(collection(db, 'assignments'), where('weekId','==',weekId)));
@@ -523,7 +733,6 @@ window.deleteWeek = async (weekId, name) => {
       }
       await deleteDoc(doc(db, 'assignments', d.id));
     }
-    // Xóa messages liên quan
     const msgSnap = await getDocs(query(collection(db, 'messages'), where('weekId','==',weekId)));
     for (const m of msgSnap.docs){
       await deleteDoc(doc(db, 'messages', m.id));
@@ -539,14 +748,27 @@ window.openCreateAssignment = () => {
     title: '👤 Tạo phân công',
     wide: true,
     body: `
+      <div class="hint">
+        🕐 <b>Deadline không bắt buộc</b> — để trống nếu ngày đó không cần đánh giá.
+        Nếu điền, hệ thống sẽ đánh giá: <b>đúng giờ</b> / <b>trễ</b> / <b>không lao động</b> (quá giờ + 10 phút mà chưa nộp).
+      </div>
       <div class="field">
         <label>Tên học sinh *</label>
         <input id="a-name" placeholder="VD: Nguyễn Văn A" autocomplete="off"/>
       </div>
       ${DAYS.map(d => `
-        <div class="field">
-          <label>${DAY_LABEL[d]}</label>
-          <input id="a-${d}" placeholder="Nội dung trực nhật..." autocomplete="off"/>
+        <div style="padding:12px;background:#fafbff;border:1px solid var(--border-soft);border-radius:12px;margin-bottom:10px">
+          <div style="font-weight:800;font-size:13.5px;color:var(--primary-dark);margin-bottom:8px">
+            ${DAY_LABEL[d]} ${currentWeekData?.startDate ? `<span style="color:var(--muted);font-weight:500;font-size:12px">· ${fmtDateShort(addDaysISO(currentWeekData.startDate, DAY_INDEX[d]))}</span>` : ''}
+          </div>
+          <div class="field" style="margin-bottom:8px">
+            <label style="font-size:12px">Nội dung</label>
+            <input id="a-${d}" placeholder="VD: Quét sân trường..." autocomplete="off"/>
+          </div>
+          <div class="field" style="margin-bottom:0">
+            <label style="font-size:12px">Deadline (để trống = không đánh giá)</label>
+            <input id="d-${d}" type="time" placeholder="hh:mm"/>
+          </div>
         </div>
       `).join('')}
     `,
@@ -559,8 +781,17 @@ window.openCreateAssignment = () => {
   $('btnCreateAssign').onclick = async () => {
     const name = $('a-name').value.trim();
     if (!name){ toast('⚠️ Nhập tên học sinh'); return; }
-    const data = { weekId: view.weekId, studentName: name, createdAt: serverTimestamp() };
-    DAYS.forEach(d => data[d] = $('a-' + d).value.trim());
+    const data = {
+      weekId: view.weekId,
+      studentName: name,
+      createdAt: serverTimestamp(),
+      deadlines: {}
+    };
+    DAYS.forEach(d => {
+      data[d] = $('a-' + d).value.trim();
+      const dl = $('d-' + d).value;
+      if (dl) data.deadlines[d] = dl;
+    });
     try {
       await addDoc(collection(db, 'assignments'), data);
       toast('✅ Đã tạo phân công');
@@ -581,7 +812,7 @@ window.deleteAssignment = async (id, name) => {
   } catch(e){ toast('❌ Lỗi: ' + e.message); }
 };
 
-/* ========== CHỤP ẢNH ========== */
+/* ========== CHỤP ẢNH TRỰC NHẬT ========== */
 window.triggerCamera = (day) => {
   pendingDay = day;
   let input = $('cameraInput');
@@ -605,7 +836,6 @@ async function handleCameraFile(e){
   const day = pendingDay;
   pendingDay = null;
 
-  // Check lại giới hạn 5 ảnh
   const current = currentPhotos.filter(p => p.day === day).length;
   if (current >= MAX_PHOTOS_PER_DAY){
     toast(`⚠️ ${DAY_LABEL[day]} đã đủ ${MAX_PHOTOS_PER_DAY} ảnh`);
@@ -614,11 +844,11 @@ async function handleCameraFile(e){
 
   toast('⏳ Đang nén ảnh...');
   try {
-    const { dataUrl, sizeBytes } = await compressToDataURL(file);
-    console.log('Ảnh sau nén:', bytesToStr(sizeBytes));
+    const { dataUrl, sizeBytes } = await compressToDataURL(file, IMG_MAX_SIZE, IMG_QUALITY, IMG_MAX_BYTES);
+    console.log('Ảnh trực nhật:', bytesToStr(sizeBytes));
 
     if (sizeBytes > IMG_MAX_BYTES){
-      toast('⚠️ Ảnh vẫn quá lớn, thử chụp lại gần hơn');
+      toast('⚠️ Ảnh vẫn quá lớn, thử chụp lại');
       return;
     }
 
@@ -631,8 +861,7 @@ async function handleCameraFile(e){
 
     await addDoc(collection(db, 'photos'), {
       weekId, assignmentId, day,
-      dataUrl,
-      sizeBytes,
+      dataUrl, sizeBytes,
       uploadedAt: serverTimestamp()
     });
 
@@ -650,18 +879,45 @@ async function handleCameraFile(e){
   }
 }
 
-/* Nén ảnh thành Base64 với nhiều lần thử */
-async function compressToDataURL(file){
-  let maxSize = IMG_MAX_SIZE;
-  let quality = IMG_QUALITY;
-  let dataUrl = await _compressOnce(file, maxSize, quality);
+window.deletePhoto = async (photoId) => {
+  if (!confirm('Xóa ảnh này?')) return;
+  try {
+    await deleteDoc(doc(db, 'photos', photoId));
+    toast('🗑️ Đã xóa ảnh');
+  } catch(e){ toast('❌ Lỗi: ' + e.message); }
+};
+
+window.openPhotoView = (photoId) => {
+  const p = currentPhotos.find(x => x.id === photoId);
+  if (!p) return;
+  openModal({
+    title: '📷 Ảnh trực nhật',
+    wide: true,
+    body: `
+      <img src="${p.dataUrl}" style="width:100%;border-radius:14px"/>
+      ${isAdmin ? `<div style="margin-top:14px;font-size:13.5px;color:var(--muted);text-align:center;font-weight:500">
+        🕐 ${fmtDateTimeVN(p.uploadedAt)} (GMT+7)
+        ${p.sizeBytes ? `<br>📦 ${bytesToStr(p.sizeBytes)}` : ''}
+      </div>` : ''}
+    `,
+    footer: isAdmin ? `
+      <a class="btn ghost" href="${p.dataUrl}" download="truc_${p.id}.jpg">⬇️ Tải về</a>
+      <button class="btn danger" onclick="closeModal();setTimeout(()=>deletePhoto('${p.id}'),200)">🗑️ Xóa</button>
+    ` : `<button class="btn ghost" onclick="closeModal()">Đóng</button>`
+  });
+};
+
+/* ========== NÉN ẢNH ========== */
+async function compressToDataURL(file, maxSize, quality, maxBytes){
+  let s = maxSize, q = quality;
+  let dataUrl = await _compressOnce(file, s, q);
   let sizeBytes = Math.round((dataUrl.length * 3) / 4);
 
   let attempts = 0;
-  while (sizeBytes > IMG_MAX_BYTES && attempts < 4){
-    maxSize = Math.round(maxSize * 0.82);
-    quality = Math.max(0.35, quality - 0.08);
-    dataUrl = await _compressOnce(file, maxSize, quality);
+  while (sizeBytes > maxBytes && attempts < 5){
+    s = Math.round(s * 0.8);
+    q = Math.max(0.3, q - 0.07);
+    dataUrl = await _compressOnce(file, s, q);
     sizeBytes = Math.round((dataUrl.length * 3) / 4);
     attempts++;
   }
@@ -684,8 +940,7 @@ function _compressOnce(file, maxSize, quality){
         canvas.width = width; canvas.height = height;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(img, 0, 0, width, height);
-        const dataUrl = canvas.toDataURL('image/jpeg', quality);
-        resolve(dataUrl);
+        resolve(canvas.toDataURL('image/jpeg', quality));
       };
       img.onerror = () => reject(new Error('Không đọc được ảnh'));
       img.src = e.target.result;
@@ -695,35 +950,168 @@ function _compressOnce(file, maxSize, quality){
   });
 }
 
-window.deletePhoto = async (photoId) => {
-  if (!confirm('Xóa ảnh này?')) return;
+/* ========== MÁCH LẺO — ĐĂNG BÀI ========== */
+$('fabConfess').onclick = () => {
+  openCreateConfess();
+};
+
+window.openCreateConfess = () => {
+  confessImages = [];
+  openModal({
+    title: '🚨 Đăng mách lẻo',
+    wide: true,
+    body: `
+      <div class="field">
+        <label class="checkbox-label">
+          <input type="checkbox" id="c-anon" checked/>
+          <span>Ẩn danh (không hiện tên người đăng)</span>
+        </label>
+      </div>
+      <div class="field" id="c-author-wrap" style="display:none">
+        <label>Tên bạn</label>
+        <input id="c-author" placeholder="VD: Nguyễn Văn A" autocomplete="off"/>
+      </div>
+      <div class="field">
+        <label>Nội dung mách lẻo *</label>
+        <textarea id="c-content" rows="4" placeholder="VD: Bạn A hôm nay không trực nhật mà đi chơi..."></textarea>
+      </div>
+      <div class="field">
+        <label>Ảnh bằng chứng (tối đa ${MAX_CONFESS_IMAGES} ảnh)</label>
+        <div class="img-picker" id="imgPicker"></div>
+        <div style="font-size:12px;color:var(--muted);margin-top:6px">
+          Tổng dung lượng tối đa: ${bytesToStr(CONFESS_TOTAL_MAX_BYTES)}
+        </div>
+      </div>
+    `,
+    footer: `
+      <button class="btn ghost" onclick="closeModal()">Hủy</button>
+      <button class="btn pink" id="btnCreateConfess">Đăng bài</button>
+    `,
+    onOpen: () => {
+      renderImgPicker();
+      const anon = $('c-anon');
+      const wrap = $('c-author-wrap');
+      anon.addEventListener('change', () => {
+        wrap.style.display = anon.checked ? 'none' : 'block';
+      });
+    }
+  });
+
+  $('btnCreateConfess').onclick = submitConfess;
+};
+
+function renderImgPicker(){
+  const picker = $('imgPicker');
+  if (!picker) return;
+  const canAdd = confessImages.length < MAX_CONFESS_IMAGES;
+  picker.innerHTML = `
+    ${confessImages.map((src, i) => `
+      <div class="img-thumb">
+        <img src="${src}"/>
+        <button class="img-thumb-del" onclick="removeConfessImage(${i})" title="Xóa">✕</button>
+      </div>
+    `).join('')}
+    ${canAdd ? `
+      <button class="img-add" onclick="pickConfessImage()" title="Thêm ảnh">
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+      </button>
+    ` : ''}
+  `;
+}
+
+window.removeConfessImage = (i) => {
+  confessImages.splice(i, 1);
+  renderImgPicker();
+};
+
+window.pickConfessImage = () => {
+  let input = $('confessCameraInput');
+  if (!input){
+    input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.capture = 'environment';
+    input.id = 'confessCameraInput';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+  }
+  input.value = '';
+  input.onchange = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (confessImages.length >= MAX_CONFESS_IMAGES){
+      toast(`⚠️ Tối đa ${MAX_CONFESS_IMAGES} ảnh`);
+      return;
+    }
+    toast('⏳ Đang nén ảnh...');
+    try {
+      const { dataUrl, sizeBytes } = await compressToDataURL(
+        file, CONFESS_IMG_MAX_SIZE, CONFESS_IMG_QUALITY, CONFESS_IMG_MAX_BYTES
+      );
+      // Kiểm tra tổng dung lượng
+      const currentTotal = confessImages.reduce((sum, d) =>
+        sum + Math.round((d.length * 3) / 4), 0);
+      if (currentTotal + sizeBytes > CONFESS_TOTAL_MAX_BYTES){
+        toast('⚠️ Tổng ảnh quá lớn, xóa bớt ảnh cũ');
+        return;
+      }
+      confessImages.push(dataUrl);
+      renderImgPicker();
+      console.log('Ảnh mách lẻo:', bytesToStr(sizeBytes), '| Tổng:', confessImages.length);
+    } catch(err){
+      toast('❌ Lỗi: ' + err.message);
+    }
+  };
+  input.click();
+};
+
+async function submitConfess(){
+  const anon = $('c-anon').checked;
+  const author = anon ? '' : ($('c-author').value.trim() || 'Ẩn danh');
+  const content = $('c-content').value.trim();
+
+  if (!content && !confessImages.length){
+    toast('⚠️ Nhập nội dung hoặc chọn ảnh');
+    return;
+  }
+
+  // Kiểm tra tổng dung lượng lần cuối
+  const totalBytes = confessImages.reduce((sum, d) =>
+    sum + Math.round((d.length * 3) / 4), 0);
+  if (totalBytes > CONFESS_TOTAL_MAX_BYTES){
+    toast('⚠️ Tổng ảnh quá lớn');
+    return;
+  }
+
   try {
-    await deleteDoc(doc(db, 'photos', photoId));
-    toast('🗑️ Đã xóa ảnh');
+    await addDoc(collection(db, 'confesses'), {
+      author: author || 'Ẩn danh',
+      anonymous: anon,
+      content,
+      images: confessImages,
+      totalBytes,
+      createdAt: serverTimestamp()
+    });
+    toast('✅ Đã đăng mách lẻo');
+    confessImages = [];
+    closeModal();
+  } catch(e){
+    toast('❌ Lỗi: ' + e.message);
+  }
+}
+
+window.deleteConfess = async (id) => {
+  if (!confirm('Xóa bài mách lẻo này?')) return;
+  try {
+    await deleteDoc(doc(db, 'confesses', id));
+    toast('🗑️ Đã xóa bài');
   } catch(e){ toast('❌ Lỗi: ' + e.message); }
 };
 
-window.openPhotoView = (photoId) => {
-  const p = currentPhotos.find(x => x.id === photoId);
-  if (!p) return;
-  openModal({
-    title: '📷 Ảnh trực nhật',
-    wide: true,
-    body: `
-      <img src="${p.dataUrl}" style="width:100%;border-radius:14px;box-shadow:0 8px 24px rgba(15,23,42,.15)"/>
-      ${isAdmin ? `<div style="margin-top:14px;font-size:13.5px;color:var(--muted);text-align:center;font-weight:500">
-        🕐 Tải lên lúc: <b style="color:var(--primary-dark)">${fmtDateTimeVN(p.uploadedAt)}</b> (GMT+7)
-        ${p.sizeBytes ? `<br>📦 Dung lượng: ${bytesToStr(p.sizeBytes)}` : ''}
-      </div>` : ''}
-    `,
-    footer: isAdmin ? `
-      <a class="btn ghost" href="${p.dataUrl}" download="truc_${p.id}.jpg">⬇️ Tải về</a>
-      <button class="btn danger" onclick="closeModal();setTimeout(()=>deletePhoto('${p.id}'),200)">🗑️ Xóa ảnh</button>
-    ` : `<button class="btn ghost" onclick="closeModal()">Đóng</button>`
-  });
-};
-
-/* ========== HỘP THƯ ========== */
+/* ========== HỘP THƯ ADMIN ========== */
 $('inboxBtn').onclick = () => {
   openModal({
     title: '📬 Hộp thư thông báo',
@@ -741,7 +1129,7 @@ function renderInboxModal(){
       <div class="empty" style="padding:40px 16px">
         <div class="empty-icon">📭</div>
         <h3>Hộp thư trống</h3>
-        <p>Chưa có thông báo nào từ học sinh.</p>
+        <p>Chưa có thông báo nào.</p>
       </div>`;
     return;
   }
@@ -775,6 +1163,7 @@ view = { screen: 'home', weekId: null, assignmentId: null };
 
 subscribeWeeks();
 subscribeMessages();
+subscribeConfesses();
 renderScreen();
 
 console.log('%c✅ App đã khởi động','color:#10b981;font-weight:bold;font-size:14px');
