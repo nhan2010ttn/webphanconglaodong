@@ -4,7 +4,7 @@ import {
   query, where, orderBy, onSnapshot, getDocs, serverTimestamp, limit
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
-/* ========== DÁN CONFIG CỦA BẠN VÀO ĐÂY ========== */
+/* ========== FIREBASE CONFIG ========== */
 const firebaseConfig = {
   apiKey: "AIzaSyCYwWT5iIRCEkjHGA_YmZ80brKr5bu-Gp0",
   authDomain: "phancongtruc-e5fb6.firebaseapp.com",
@@ -13,19 +13,20 @@ const firebaseConfig = {
   messagingSenderId: "542899039872",
   appId: "1:542899039872:web:ad4f30b61fbac633710065"
 };
-/* ================================================ */
 
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
 
+/* ========== CONSTANTS ========== */
 const ADMIN_PASSWORD = "13579";
 const DAYS = ['mon','tue','wed','thu','fri','sat'];
 const DAY_LABEL = { mon:'Thứ 2', tue:'Thứ 3', wed:'Thứ 4', thu:'Thứ 5', fri:'Thứ 6', sat:'Thứ 7' };
 const MAX_PHOTOS_PER_DAY = 5;
 
 /* Kích thước nén ảnh — càng nhỏ càng tiết kiệm Firestore */
-const IMG_MAX_SIZE = 900;      // px cạnh dài nhất
-const IMG_QUALITY = 0.55;      // 0..1 — càng nhỏ càng nhẹ
+const IMG_MAX_SIZE = 900;
+const IMG_QUALITY = 0.55;
+const IMG_MAX_BYTES = 700 * 1024; // giới hạn an toàn dưới 1MB/document
 
 /* ========== STATE ========== */
 let isAdmin = false;
@@ -38,6 +39,10 @@ let currentAssignmentData = null;
 let currentPhotos = [];
 let pendingDay = null;
 
+let weekUnsub = null;
+let assignUnsub = null;
+let photoUnsub = null;
+
 /* ========== HELPERS ========== */
 const $ = id => document.getElementById(id);
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
@@ -49,7 +54,7 @@ function toast(msg){
   el.textContent = msg;
   el.classList.add('show');
   clearTimeout(el._t);
-  el._t = setTimeout(() => el.classList.remove('show'), 2200);
+  el._t = setTimeout(() => el.classList.remove('show'), 2400);
 }
 window.toast = toast;
 
@@ -76,7 +81,7 @@ function initials(name){
   return (parts.length > 1 ? parts[0][0] + parts[parts.length-1][0]
                             : parts[0].slice(0,2)).toUpperCase();
 }
-function bytesToMB(b){
+function bytesToStr(b){
   if (b < 1024) return b + ' B';
   if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
   return (b/(1024*1024)).toFixed(2) + ' MB';
@@ -84,58 +89,96 @@ function bytesToMB(b){
 
 /* ========== MODAL ========== */
 function openModal({ title, body, footer, wide, onOpen }){
+  // Push history state để nút back đóng được modal
+  history.pushState({ ...(history.state || {}), _modal: true }, '');
+
   $('modalRoot').innerHTML = `
     <div class="modal-overlay" id="overlay">
       <div class="modal ${wide ? 'wide' : ''}">
         <div class="modal-head">
           <h2>${title}</h2>
-          <button class="icon-btn" id="modalClose">✕</button>
+          <button class="icon-btn" id="modalClose" aria-label="Đóng">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"/>
+              <line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
         </div>
         <div class="modal-body">${body}</div>
         ${footer ? `<div class="modal-foot">${footer}</div>` : ''}
       </div>
     </div>`;
+
   $('modalClose').onclick = closeModal;
   $('overlay').addEventListener('click', e => { if (e.target.id === 'overlay') closeModal(); });
   document.addEventListener('keydown', escHandler);
   if (onOpen) onOpen();
 }
+
 function closeModal(){
+  if (!document.querySelector('.modal-overlay')) return;
+  // Nếu state hiện tại là modal → gọi back để tránh bị kẹt history
+  if (history.state?._modal){
+    history.back();
+    return;
+  }
+  // Fallback
   $('modalRoot').innerHTML = '';
   document.removeEventListener('keydown', escHandler);
 }
 function escHandler(e){ if (e.key === 'Escape') closeModal(); }
 window.closeModal = closeModal;
 
-/* ========== HEADER / FAB ========== */
+/* ========== HEADER / FAB / BREADCRUMB ========== */
 function updateHeader(){
   const backBtn = $('backBtn');
   const title = $('pageTitle');
+  const bc = $('breadcrumb');
   const inboxBtn = $('inboxBtn');
 
+  // Nút back
+  backBtn.classList.toggle('hidden', view.screen === 'home');
+
+  // Title
   if (view.screen === 'home'){
-    backBtn.classList.add('hidden');
-    title.textContent = '📋 Phân Công Trực Nhật';
+    title.textContent = 'Phân Công Trực Nhật';
   } else if (view.screen === 'week'){
-    backBtn.classList.remove('hidden');
     title.textContent = currentWeekData ? currentWeekData.name : 'Tuần';
   } else if (view.screen === 'assignment'){
-    backBtn.classList.remove('hidden');
     title.textContent = currentAssignmentData ? currentAssignmentData.studentName : 'Chi tiết';
   }
+
+  // Breadcrumb
+  if (view.screen === 'home'){
+    bc.classList.add('hidden');
+  } else if (view.screen === 'week'){
+    bc.classList.remove('hidden');
+    bc.innerHTML = `<span>Trang chủ</span><span class="sep">›</span><span class="current">${esc(currentWeekData?.name || '...')}</span>`;
+  } else if (view.screen === 'assignment'){
+    bc.classList.remove('hidden');
+    bc.innerHTML = `<span>Trang chủ</span><span class="sep">›</span><span>${esc(currentWeekData?.name || '...')}</span><span class="sep">›</span><span class="current">${esc(currentAssignmentData?.studentName || '...')}</span>`;
+  }
+
+  // Hộp thư
   inboxBtn.classList.toggle('hidden', !isAdmin);
 }
 
 function updateFab(){
   const fab = $('fabAdmin');
   if (isAdmin){
-    fab.textContent = '👑';
-    fab.style.background = 'linear-gradient(135deg,#16a34a,#22c55e)';
+    fab.classList.add('admin');
     fab.title = 'Đang ở chế độ Admin (bấm để thoát)';
+    fab.innerHTML = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M2 4l3 12h14l3-12-6 7-4-7-4 7-6-7z"/>
+      <path d="M5 20h14"/>
+    </svg>`;
   } else {
-    fab.textContent = '🔐';
-    fab.style.background = 'linear-gradient(135deg,#1e293b,#334155)';
+    fab.classList.remove('admin');
     fab.title = 'Quyền Admin';
+    fab.innerHTML = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="11" width="18" height="11" rx="2"/>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+    </svg>`;
   }
 }
 
@@ -150,6 +193,122 @@ function updateInboxBadge(){
   }
 }
 
+/* ========== NAVIGATION ========== */
+function cleanupSubs(){
+  if (weekUnsub){ weekUnsub(); weekUnsub = null; }
+  if (assignUnsub){ assignUnsub(); assignUnsub = null; }
+  if (photoUnsub){ photoUnsub(); photoUnsub = null; }
+}
+
+function navigate(screen, params = {}, push = true){
+  cleanupSubs();
+  const newState = { screen, ...params };
+  if (push) history.pushState(newState, '');
+  applyState(newState);
+}
+
+function applyState(state){
+  view = state;
+
+  // Reset dữ liệu tạm
+  if (state.screen === 'home'){
+    currentWeekData = null;
+    currentAssignments = [];
+    currentAssignmentData = null;
+    currentPhotos = [];
+  } else if (state.screen === 'week'){
+    currentAssignments = [];
+    currentAssignmentData = null;
+    currentPhotos = [];
+  } else if (state.screen === 'assignment'){
+    currentPhotos = [];
+  }
+
+  renderScreen();
+  window.scrollTo({ top: 0, behavior: 'auto' });
+}
+
+function renderScreen(){
+  updateHeader();
+  updateFab();
+  updateInboxBadge();
+
+  if (view.screen === 'home'){
+    renderHome();
+  } else if (view.screen === 'week'){
+    const w = weeks.find(x => x.id === view.weekId);
+    if (w) currentWeekData = w;
+    renderWeek();
+    // Subscribe assignments
+    const q = query(collection(db, 'assignments'), where('weekId','==',view.weekId));
+    weekUnsub = onSnapshot(q, snap => {
+      currentAssignments = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((a,b) => (a.studentName||'').localeCompare(b.studentName||'', 'vi'));
+      if (view.screen === 'week') renderWeek();
+    }, err => { console.error(err); toast('❌ Lỗi tải: ' + err.message); });
+  } else if (view.screen === 'assignment'){
+    // Nếu chưa có currentAssignmentData (VD khi reload trang), chờ từ snapshot của week
+    const a = currentAssignments.find(x => x.id === view.assignmentId);
+    if (a) currentAssignmentData = a;
+    renderAssignment();
+    // Subscribe assignment detail
+    assignUnsub = onSnapshot(doc(db, 'assignments', view.assignmentId), snap => {
+      if (snap.exists()){
+        currentAssignmentData = { id: snap.id, ...snap.data() };
+        if (view.screen === 'assignment') { renderAssignment(); updateHeader(); }
+      }
+    });
+    // Subscribe photos
+    const pq = query(collection(db, 'photos'), where('assignmentId','==',view.assignmentId));
+    photoUnsub = onSnapshot(pq, snap => {
+      currentPhotos = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((a,b) => {
+          const ta = a.uploadedAt?.toMillis?.() || 0;
+          const tb = b.uploadedAt?.toMillis?.() || 0;
+          return ta - tb;
+        });
+      if (view.screen === 'assignment') renderAssignment();
+    });
+  }
+}
+
+/* Public API cho HTML onclick */
+window.openWeek = (weekId) => {
+  navigate('week', { weekId, assignmentId: null });
+};
+
+window.openAssignment = (assignmentId) => {
+  navigate('assignment', { weekId: view.weekId, assignmentId });
+};
+
+/* Nút back trên header */
+$('backBtn').onclick = () => history.back();
+
+/* Xử lý nút back cứng + browser back */
+window.addEventListener('popstate', (e) => {
+  const state = e.state || { screen: 'home', weekId: null, assignmentId: null };
+
+  // Nếu đang có modal → đóng modal
+  if (document.querySelector('.modal-overlay')){
+    $('modalRoot').innerHTML = '';
+    document.removeEventListener('keydown', escHandler);
+    // Nếu state mới có _modal thì push lại state đó để giữ modal "ảo"
+    if (state._modal){
+      history.pushState(state, '');
+      return;
+    }
+  }
+
+  // Nếu state là _modal thuần → không điều hướng
+  if (state._modal){
+    // Tìm state gần nhất không phải modal
+    return;
+  }
+
+  cleanupSubs();
+  applyState(state);
+});
+
 /* ========== SUBSCRIBE FIREBASE ========== */
 function subscribeWeeks(){
   const q = query(collection(db, 'weeks'), orderBy('order','asc'));
@@ -157,9 +316,9 @@ function subscribeWeeks(){
     weeks = snap.docs.map(d => ({ id: d.id, ...d.data() }));
     if (view.screen === 'week' && view.weekId){
       const w = weeks.find(x => x.id === view.weekId);
-      if (w) currentWeekData = w;
+      if (w) { currentWeekData = w; updateHeader(); }
     }
-    renderAll();
+    if (view.screen === 'home') renderHome();
   }, err => console.error('weeks:', err));
 }
 
@@ -172,15 +331,7 @@ function subscribeMessages(){
   }, err => console.error('messages:', err));
 }
 
-/* ========== RENDER CHÍNH ========== */
-function renderAll(){
-  updateHeader();
-  updateFab();
-  if (view.screen === 'home') renderHome();
-  else if (view.screen === 'week') renderWeek();
-  else if (view.screen === 'assignment') renderAssignment();
-}
-
+/* ========== RENDER: HOME ========== */
 function renderHome(){
   const c = $('content');
   if (!weeks.length){
@@ -194,31 +345,52 @@ function renderHome(){
     return;
   }
   c.innerHTML = `
-    ${isAdmin ? '<button class="btn primary" style="margin-bottom:16px" onclick="openCreateWeek()">+ Tạo tuần</button>' : ''}
+    ${isAdmin ? `<div class="section-head">
+      <div class="section-title">Danh sách tuần</div>
+      <button class="btn primary" onclick="openCreateWeek()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        Tạo tuần
+      </button>
+    </div>` : ''}
     <div class="week-grid">
       ${weeks.map(w => `
         <div class="week-card" onclick="openWeek('${w.id}')">
+          <div class="week-icon">📅</div>
           <div class="week-name">${esc(w.name)}</div>
-          <div class="week-meta">${w.createdAt ? fmtDateTimeVN(w.createdAt) : ''}</div>
+          <div class="week-meta">${w.createdAt ? fmtDateTimeVN(w.createdAt) : 'Mới tạo'}</div>
           ${isAdmin ? `<button class="week-delete"
             onclick="event.stopPropagation();deleteWeek('${w.id}','${esc(w.name)}')"
-            title="Xóa tuần">🗑️</button>` : ''}
+            title="Xóa tuần">✕</button>` : ''}
         </div>`).join('')}
     </div>`;
 }
 
+/* ========== RENDER: WEEK ========== */
 function renderWeek(){
   const c = $('content');
   if (!currentWeekData){
-    c.innerHTML = '<div class="empty">Đang tải...</div>';
+    c.innerHTML = `<div class="empty"><div class="empty-icon">⏳</div><h3>Đang tải...</h3></div>`;
     return;
   }
   c.innerHTML = `
-    ${isAdmin ? '<button class="btn primary" style="margin-bottom:16px" onclick="openCreateAssignment()">+ Tạo phân công</button>' : ''}
+    ${isAdmin ? `<div class="section-head">
+      <div class="section-title">${esc(currentWeekData.name)}</div>
+      <button class="btn primary" onclick="openCreateAssignment()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        Phân công
+      </button>
+    </div>` : ''}
     ${currentAssignments.length === 0
-      ? `<div class="empty"><div class="empty-icon">👥</div>
+      ? `<div class="empty">
+           <div class="empty-icon">👥</div>
            <h3>Chưa có phân công</h3>
-           <p>${isAdmin ? 'Bấm "Tạo phân công" để thêm.' : 'Chưa có dữ liệu.'}</p></div>`
+           <p>${isAdmin ? 'Bấm "Phân công" để thêm học sinh.' : 'Chưa có dữ liệu. Vui lòng chờ admin.'}</p>
+           ${isAdmin ? '<button class="btn primary" onclick="openCreateAssignment()">+ Tạo phân công</button>' : ''}
+         </div>`
       : `<div class="assign-grid">
            ${currentAssignments.map(a => assignmentCardHTML(a)).join('')}
          </div>`}`;
@@ -231,18 +403,19 @@ function assignmentCardHTML(a){
       <div class="assign-avatar">${esc(initials(a.studentName))}</div>
       <div class="assign-info">
         <div class="assign-name">${esc(a.studentName)}</div>
-        <div class="assign-meta">${hasContent ? 'Đã có lịch trực' : 'Chưa có lịch'}</div>
+        <div class="assign-meta">${hasContent ? '📌 Đã có lịch trực' : 'Chưa có lịch'}</div>
       </div>
       ${isAdmin ? `<button class="assign-delete"
         onclick="event.stopPropagation();deleteAssignment('${a.id}','${esc(a.studentName)}')"
-        title="Xóa">🗑️</button>` : ''}
+        title="Xóa">✕</button>` : ''}
     </div>`;
 }
 
+/* ========== RENDER: ASSIGNMENT ========== */
 function renderAssignment(){
   const c = $('content');
   if (!currentAssignmentData){
-    c.innerHTML = '<div class="empty">Đang tải...</div>';
+    c.innerHTML = `<div class="empty"><div class="empty-icon">⏳</div><h3>Đang tải...</h3></div>`;
     return;
   }
   c.innerHTML = `<div class="day-grid">
@@ -253,12 +426,13 @@ function renderAssignment(){
 function dayCardHTML(day, content){
   const photos = currentPhotos.filter(p => p.day === day);
   const canUpload = photos.length < MAX_PHOTOS_PER_DAY;
+  const isFull = photos.length >= MAX_PHOTOS_PER_DAY;
 
   return `
     <div class="day-card">
       <div class="day-head">
         <div class="day-name">${DAY_LABEL[day]}</div>
-        <div class="day-count">${photos.length}/${MAX_PHOTOS_PER_DAY} ảnh</div>
+        <div class="day-count ${isFull ? 'full' : ''}">${photos.length}/${MAX_PHOTOS_PER_DAY} ảnh</div>
       </div>
       <div class="day-content">${
         content ? esc(content) : '<span class="empty-text">Không có nội dung</span>'
@@ -266,92 +440,42 @@ function dayCardHTML(day, content){
       <div class="photo-grid">
         ${photos.map(p => `
           <div class="photo-item">
-            <img src="${p.dataUrl}" onclick="openPhotoView('${p.id}')" loading="lazy"/>
+            <img src="${p.dataUrl}" onclick="openPhotoView('${p.id}')" loading="lazy" alt="Ảnh trực nhật"/>
             ${isAdmin ? `<button class="photo-del"
               onclick="event.stopPropagation();deletePhoto('${p.id}')"
               title="Xóa ảnh">✕</button>` : ''}
             ${isAdmin ? `<div class="photo-time">${fmtDateTimeVN(p.uploadedAt)}</div>` : ''}
           </div>`).join('')}
         ${canUpload ? `<button class="photo-add"
-          onclick="triggerCamera('${day}')" title="Chụp ảnh"><span>+</span></button>` : ''}
+          onclick="triggerCamera('${day}')" title="Chụp ảnh">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"/>
+            <line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+        </button>` : ''}
       </div>
     </div>`;
 }
 
-/* ========== NAVIGATION ========== */
-window.openWeek = (weekId) => {
-  const w = weeks.find(x => x.id === weekId);
-  if (!w) return;
-  currentWeekData = w;
-  view = { screen:'week', weekId, assignmentId:null };
-  renderWeek();
-
-  if (window._weekUnsub) { window._weekUnsub(); window._weekUnsub = null; }
-  const q = query(collection(db, 'assignments'), where('weekId','==',weekId));
-  window._weekUnsub = onSnapshot(q, snap => {
-    currentAssignments = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-      .sort((a,b) => (a.studentName||'').localeCompare(b.studentName||'', 'vi'));
-    if (view.screen === 'week') renderWeek();
-  }, err => { console.error(err); toast('❌ Lỗi tải: ' + err.message); });
-};
-
-window.openAssignment = (assignmentId) => {
-  const a = currentAssignments.find(x => x.id === assignmentId);
-  if (!a) return;
-  currentAssignmentData = a;
-  view = { screen:'assignment', weekId: a.weekId, assignmentId };
-  currentPhotos = [];
-  renderAssignment();
-
-  if (window._assignUnsub) { window._assignUnsub(); window._assignUnsub = null; }
-  if (window._photoUnsub) { window._photoUnsub(); window._photoUnsub = null; }
-
-  window._assignUnsub = onSnapshot(doc(db, 'assignments', assignmentId), snap => {
-    if (snap.exists()){
-      currentAssignmentData = { id: snap.id, ...snap.data() };
-      if (view.screen === 'assignment') renderAssignment();
-    }
-  });
-
-  const pq = query(collection(db, 'photos'), where('assignmentId','==',assignmentId));
-  window._photoUnsub = onSnapshot(pq, snap => {
-    currentPhotos = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-      .sort((a,b) => {
-        const ta = a.uploadedAt?.toMillis?.() || 0;
-        const tb = b.uploadedAt?.toMillis?.() || 0;
-        return ta - tb;
-      });
-    if (view.screen === 'assignment') renderAssignment();
-  });
-};
-
-$('backBtn').onclick = () => {
-  if (view.screen === 'assignment'){
-    if (window._assignUnsub) { window._assignUnsub(); window._assignUnsub = null; }
-    if (window._photoUnsub) { window._photoUnsub(); window._photoUnsub = null; }
-    currentPhotos = [];
-    view = { screen:'week', weekId: view.weekId, assignmentId:null };
-    renderWeek();
-  } else if (view.screen === 'week'){
-    if (window._weekUnsub) { window._weekUnsub(); window._weekUnsub = null; }
-    currentAssignments = [];
-    currentWeekData = null;
-    view = { screen:'home', weekId:null, assignmentId:null };
-    renderHome();
-    updateHeader();
-  }
-};
-
-/* ========== ADMIN ========== */
+/* ========== ADMIN LOGIN ========== */
 $('fabAdmin').onclick = () => {
   if (isAdmin){
-    if (confirm('Thoát chế độ Admin?')){ isAdmin = false; toast('Đã thoát Admin'); renderAll(); }
+    if (confirm('Thoát chế độ Admin?')){
+      isAdmin = false;
+      toast('Đã thoát Admin');
+      renderScreen();
+    }
     return;
   }
   const pw = prompt('Nhập mật khẩu Admin:');
   if (pw === null) return;
-  if (pw === ADMIN_PASSWORD){ isAdmin = true; toast('✅ Đã vào Admin'); renderAll(); }
-  else toast('❌ Sai mật khẩu');
+  if (pw === ADMIN_PASSWORD){
+    isAdmin = true;
+    toast('✅ Đã vào chế độ Admin');
+    renderScreen();
+  } else {
+    toast('❌ Sai mật khẩu');
+  }
 };
 
 /* ========== TẠO TUẦN ========== */
@@ -360,15 +484,21 @@ window.openCreateWeek = () => {
   openModal({
     title: '📅 Tạo tuần mới',
     body: `
-      <div class="field"><label>Tên tuần</label>
-        <input id="w-name" value="${esc(suggested)}" autocomplete="off"/></div>
-      <div class="field"><label>Thứ tự (số)</label>
-        <input id="w-order" type="number" value="${weeks.length + 1}" min="1"/></div>
+      <div class="field">
+        <label>Tên tuần</label>
+        <input id="w-name" value="${esc(suggested)}" autocomplete="off" placeholder="VD: Tuần 1"/>
+      </div>
+      <div class="field">
+        <label>Thứ tự (số càng nhỏ càng lên đầu)</label>
+        <input id="w-order" type="number" value="${weeks.length + 1}" min="1"/>
+      </div>
     `,
-    footer: `<button class="btn ghost" onclick="closeModal()">Hủy</button>
-             <button class="btn primary" id="btnCreateWeek">Tạo</button>`
+    footer: `
+      <button class="btn ghost" onclick="closeModal()">Hủy</button>
+      <button class="btn primary" id="btnCreateWeek">Tạo tuần</button>
+    `
   });
-  setTimeout(() => $('w-name')?.focus(), 50);
+  setTimeout(() => $('w-name')?.focus(), 100);
   $('btnCreateWeek').onclick = async () => {
     const name = $('w-name').value.trim();
     const order = parseInt($('w-order').value) || (weeks.length + 1);
@@ -393,6 +523,11 @@ window.deleteWeek = async (weekId, name) => {
       }
       await deleteDoc(doc(db, 'assignments', d.id));
     }
+    // Xóa messages liên quan
+    const msgSnap = await getDocs(query(collection(db, 'messages'), where('weekId','==',weekId)));
+    for (const m of msgSnap.docs){
+      await deleteDoc(doc(db, 'messages', m.id));
+    }
     await deleteDoc(doc(db, 'weeks', weekId));
     toast('🗑️ Đã xóa tuần');
   } catch(e){ toast('❌ Lỗi: ' + e.message); }
@@ -404,17 +539,23 @@ window.openCreateAssignment = () => {
     title: '👤 Tạo phân công',
     wide: true,
     body: `
-      <div class="field"><label>Tên học sinh *</label>
-        <input id="a-name" placeholder="Nguyễn Văn A" autocomplete="off"/></div>
+      <div class="field">
+        <label>Tên học sinh *</label>
+        <input id="a-name" placeholder="VD: Nguyễn Văn A" autocomplete="off"/>
+      </div>
       ${DAYS.map(d => `
-        <div class="field"><label>${DAY_LABEL[d]}</label>
-          <input id="a-${d}" placeholder="Nội dung trực..." autocomplete="off"/></div>
+        <div class="field">
+          <label>${DAY_LABEL[d]}</label>
+          <input id="a-${d}" placeholder="Nội dung trực nhật..." autocomplete="off"/>
+        </div>
       `).join('')}
     `,
-    footer: `<button class="btn ghost" onclick="closeModal()">Hủy</button>
-             <button class="btn primary" id="btnCreateAssign">Tạo</button>`
+    footer: `
+      <button class="btn ghost" onclick="closeModal()">Hủy</button>
+      <button class="btn primary" id="btnCreateAssign">Tạo phân công</button>
+    `
   });
-  setTimeout(() => $('a-name')?.focus(), 50);
+  setTimeout(() => $('a-name')?.focus(), 100);
   $('btnCreateAssign').onclick = async () => {
     const name = $('a-name').value.trim();
     if (!name){ toast('⚠️ Nhập tên học sinh'); return; }
@@ -429,7 +570,7 @@ window.openCreateAssignment = () => {
 };
 
 window.deleteAssignment = async (id, name) => {
-  if (!confirm(`Xóa phân công của "${name}"?`)) return;
+  if (!confirm(`Xóa phân công của "${name}"?\n\nẢnh đã chụp cũng sẽ bị xóa.`)) return;
   try {
     const photoSnap = await getDocs(query(collection(db, 'photos'), where('assignmentId','==',id)));
     for (const p of photoSnap.docs){
@@ -464,6 +605,7 @@ async function handleCameraFile(e){
   const day = pendingDay;
   pendingDay = null;
 
+  // Check lại giới hạn 5 ảnh
   const current = currentPhotos.filter(p => p.day === day).length;
   if (current >= MAX_PHOTOS_PER_DAY){
     toast(`⚠️ ${DAY_LABEL[day]} đã đủ ${MAX_PHOTOS_PER_DAY} ảnh`);
@@ -472,12 +614,11 @@ async function handleCameraFile(e){
 
   toast('⏳ Đang nén ảnh...');
   try {
-    const dataUrl = await compressToDataURL(file, IMG_MAX_SIZE, IMG_QUALITY);
-    const sizeBytes = Math.round((dataUrl.length * 3) / 4);
-    console.log('Ảnh sau nén:', bytesToMB(sizeBytes));
+    const { dataUrl, sizeBytes } = await compressToDataURL(file);
+    console.log('Ảnh sau nén:', bytesToStr(sizeBytes));
 
-    if (sizeBytes > 900 * 1024){
-      toast('⚠️ Ảnh còn quá lớn, thử lại với ảnh khác');
+    if (sizeBytes > IMG_MAX_BYTES){
+      toast('⚠️ Ảnh vẫn quá lớn, thử chụp lại gần hơn');
       return;
     }
 
@@ -498,7 +639,6 @@ async function handleCameraFile(e){
     await addDoc(collection(db, 'messages'), {
       type: 'photo_upload',
       weekId, weekName, assignmentId, studentName, day,
-      photoPreview: dataUrl.slice(0, 2000),
       uploadedAt: serverTimestamp(),
       read: false
     });
@@ -510,8 +650,25 @@ async function handleCameraFile(e){
   }
 }
 
-/* Nén ảnh thành Base64 data URL */
-function compressToDataURL(file, maxSize, quality){
+/* Nén ảnh thành Base64 với nhiều lần thử */
+async function compressToDataURL(file){
+  let maxSize = IMG_MAX_SIZE;
+  let quality = IMG_QUALITY;
+  let dataUrl = await _compressOnce(file, maxSize, quality);
+  let sizeBytes = Math.round((dataUrl.length * 3) / 4);
+
+  let attempts = 0;
+  while (sizeBytes > IMG_MAX_BYTES && attempts < 4){
+    maxSize = Math.round(maxSize * 0.82);
+    quality = Math.max(0.35, quality - 0.08);
+    dataUrl = await _compressOnce(file, maxSize, quality);
+    sizeBytes = Math.round((dataUrl.length * 3) / 4);
+    attempts++;
+  }
+  return { dataUrl, sizeBytes };
+}
+
+function _compressOnce(file, maxSize, quality){
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -550,18 +707,18 @@ window.openPhotoView = (photoId) => {
   const p = currentPhotos.find(x => x.id === photoId);
   if (!p) return;
   openModal({
-    title: '📷 Ảnh',
+    title: '📷 Ảnh trực nhật',
     wide: true,
     body: `
-      <img src="${p.dataUrl}" style="width:100%;border-radius:10px"/>
-      ${isAdmin ? `<div style="margin-top:12px;font-size:13.5px;color:var(--muted);text-align:center">
-        Tải lên lúc: <b>${fmtDateTimeVN(p.uploadedAt)}</b> (GMT+7)
-        ${p.sizeBytes ? `<br>Dung lượng: ${bytesToMB(p.sizeBytes)}` : ''}</div>` : ''}
+      <img src="${p.dataUrl}" style="width:100%;border-radius:14px;box-shadow:0 8px 24px rgba(15,23,42,.15)"/>
+      ${isAdmin ? `<div style="margin-top:14px;font-size:13.5px;color:var(--muted);text-align:center;font-weight:500">
+        🕐 Tải lên lúc: <b style="color:var(--primary-dark)">${fmtDateTimeVN(p.uploadedAt)}</b> (GMT+7)
+        ${p.sizeBytes ? `<br>📦 Dung lượng: ${bytesToStr(p.sizeBytes)}` : ''}
+      </div>` : ''}
     `,
     footer: isAdmin ? `
       <a class="btn ghost" href="${p.dataUrl}" download="truc_${p.id}.jpg">⬇️ Tải về</a>
-      <button class="btn danger"
-        onclick="closeModal();deletePhoto('${p.id}')">🗑️ Xóa</button>
+      <button class="btn danger" onclick="closeModal();setTimeout(()=>deletePhoto('${p.id}'),200)">🗑️ Xóa ảnh</button>
     ` : `<button class="btn ghost" onclick="closeModal()">Đóng</button>`
   });
 };
@@ -569,9 +726,9 @@ window.openPhotoView = (photoId) => {
 /* ========== HỘP THƯ ========== */
 $('inboxBtn').onclick = () => {
   openModal({
-    title: '📬 Hộp thư',
+    title: '📬 Hộp thư thông báo',
     wide: true,
-    body: '<div class="inbox-modal">Đang tải...</div>',
+    body: '<div class="inbox-modal"></div>',
     onOpen: renderInboxModal
   });
 };
@@ -580,29 +737,45 @@ function renderInboxModal(){
   const box = document.querySelector('.inbox-modal');
   if (!box) return;
   if (!messages.length){
-    box.innerHTML = `<div class="empty" style="padding:30px 10px">
-      <div class="empty-icon">📭</div><h3>Hộp thư trống</h3>
-      <p>Chưa có thông báo nào.</p></div>`;
+    box.innerHTML = `
+      <div class="empty" style="padding:40px 16px">
+        <div class="empty-icon">📭</div>
+        <h3>Hộp thư trống</h3>
+        <p>Chưa có thông báo nào từ học sinh.</p>
+      </div>`;
     return;
   }
   box.innerHTML = messages.map(m => `
     <div class="inbox-item ${m.read ? '' : 'unread'}" data-id="${m.id}">
-      <div class="inbox-icon">📷</div>
+      <div class="inbox-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+          <circle cx="12" cy="13" r="4"/>
+        </svg>
+      </div>
       <div class="inbox-body">
         <div class="inbox-title"><b>${esc(m.studentName)}</b> đã tải ảnh lên</div>
-        <div class="inbox-sub">${esc(m.weekName || '')} · ${DAY_LABEL[m.day] || m.day} · ${fmtRelativeVN(m.uploadedAt)}</div>
-        <div class="inbox-time">${fmtDateTimeVN(m.uploadedAt)} (GMT+7)</div>
+        <div class="inbox-sub">📅 ${esc(m.weekName || '')} · ${DAY_LABEL[m.day] || m.day}</div>
+        <div class="inbox-time">🕐 ${fmtDateTimeVN(m.uploadedAt)} (GMT+7) · ${fmtRelativeVN(m.uploadedAt)}</div>
       </div>
     </div>`).join('');
 
   box.querySelectorAll('.inbox-item').forEach(el => {
     el.onclick = async () => {
-      try { await updateDoc(doc(db, 'messages', el.dataset.id), { read: true }); } catch(e){}
+      try {
+        await updateDoc(doc(db, 'messages', el.dataset.id), { read: true });
+      } catch(e){ console.error(e); }
     };
   });
 }
 
 /* ========== KHỞI ĐỘNG ========== */
+history.replaceState({ screen: 'home', weekId: null, assignmentId: null }, '');
+view = { screen: 'home', weekId: null, assignmentId: null };
+
 subscribeWeeks();
 subscribeMessages();
-renderAll();
+renderScreen();
+
+console.log('%c✅ App đã khởi động','color:#10b981;font-weight:bold;font-size:14px');
+console.log('Firebase project:', firebaseConfig.projectId);
