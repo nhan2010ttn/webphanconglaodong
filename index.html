@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#2563eb"/>
+<title>Phân Công Trực Nhật</title>
+<link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<header class="topbar">
+  <button class="back-btn hidden" id="backBtn">←</button>
+  <h1 id="pageTitle">📋 Phân Công Trực Nhật</h1>
+  <button class="icon-btn hidden" id="inboxBtn" title="Hộp thư">
+    📬<span class="badge hidden" id="inboxBadge">0</span>
+  </button>
+</header>
+<main id="content"></main>
+<button class="fab" id="fabAdmin" title="Quyền Admin">🔐</button>
+<div id="modalRoot"></div>
+<div id="toast"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
